@@ -6,8 +6,12 @@
 #define V8_COMPILER_JS_OPERATOR_H_
 
 #include "src/base/compiler-specific.h"
+#include "src/codegen/tnode.h"
 #include "src/compiler/feedback-source.h"
 #include "src/compiler/globals.h"
+#include "src/compiler/node-properties.h"
+#include "src/compiler/node.h"
+#include "src/compiler/opcodes.h"
 #include "src/handles/maybe-handles.h"
 #include "src/objects/type-hints.h"
 #include "src/runtime/runtime.h"
@@ -24,8 +28,49 @@ class SharedFunctionInfo;
 namespace compiler {
 
 // Forward declarations.
+class JSGraph;
 class Operator;
 struct JSOperatorGlobalCache;
+
+// Macro lists.
+#define JS_UNOP_WITH_FEEDBACK(V) \
+  JS_BITWISE_UNOP_LIST(V)        \
+  JS_ARITH_UNOP_LIST(V)
+
+#define JS_BINOP_WITH_FEEDBACK(V) \
+  JS_ARITH_BINOP_LIST(V)          \
+  JS_BITWISE_BINOP_LIST(V)        \
+  JS_COMPARE_BINOP_LIST(V)
+
+// Predicates.
+class JSOperator final : public AllStatic {
+ public:
+  static constexpr bool IsUnaryWithFeedback(Operator::Opcode opcode) {
+#define CASE(Name, ...)   \
+  case IrOpcode::k##Name: \
+    return true;
+    switch (opcode) {
+      JS_UNOP_WITH_FEEDBACK(CASE);
+      default:
+        return false;
+    }
+#undef CASE
+    return false;
+  }
+
+  static constexpr bool IsBinaryWithFeedback(Operator::Opcode opcode) {
+#define CASE(Name, ...)   \
+  case IrOpcode::k##Name: \
+    return true;
+    switch (opcode) {
+      JS_BINOP_WITH_FEEDBACK(CASE);
+      default:
+        return false;
+    }
+#undef CASE
+    return false;
+  }
+};
 
 // Defines the frequency a given Call/Construct site was executed. For some
 // call sites the frequency is not known.
@@ -59,8 +104,6 @@ class CallFrequency final {
 };
 
 std::ostream& operator<<(std::ostream&, CallFrequency const&);
-
-CallFrequency CallFrequencyOf(Operator const* op) V8_WARN_UNUSED_RESULT;
 
 // Defines the flags for a JavaScript call forwarding parameters. This
 // is used as parameter by JSConstructForwardVarargs operators.
@@ -97,15 +140,32 @@ std::ostream& operator<<(std::ostream&,
 ConstructForwardVarargsParameters const& ConstructForwardVarargsParametersOf(
     Operator const*) V8_WARN_UNUSED_RESULT;
 
-// Defines the arity and the feedback for a JavaScript constructor call. This is
-// used as a parameter by JSConstruct and JSConstructWithSpread operators.
+// Part of ConstructParameters::arity.
+static constexpr int kTargetAndNewTarget = 2;
+
+// Defines the arity (parameters plus the target and new target) and the
+// feedback for a JavaScript constructor call. This is used as a parameter by
+// JSConstruct, JSConstructWithArrayLike, and JSConstructWithSpread operators.
 class ConstructParameters final {
  public:
   ConstructParameters(uint32_t arity, CallFrequency const& frequency,
                       FeedbackSource const& feedback)
-      : arity_(arity), frequency_(frequency), feedback_(feedback) {}
+      : arity_(arity), frequency_(frequency), feedback_(feedback) {
+    DCHECK_GE(arity, kTargetAndNewTarget);
+    DCHECK(is_int32(arity));
+  }
 
+  // TODO(jgruber): Consider removing `arity()` and just storing the arity
+  // without extra args in ConstructParameters. Every spot that creates
+  // ConstructParameters artifically adds the extra args. Every spot that uses
+  // ConstructParameters artificially subtracts the extra args.
+  // We keep them for now for consistency with other spots
+  // that expect `arity()` to include extra args.
   uint32_t arity() const { return arity_; }
+  int arity_without_implicit_args() const {
+    return static_cast<int>(arity_ - kTargetAndNewTarget);
+  }
+
   CallFrequency const& frequency() const { return frequency_; }
   FeedbackSource const& feedback() const { return feedback_; }
 
@@ -158,29 +218,46 @@ std::ostream& operator<<(std::ostream&, CallForwardVarargsParameters const&);
 CallForwardVarargsParameters const& CallForwardVarargsParametersOf(
     Operator const*) V8_WARN_UNUSED_RESULT;
 
-// Defines the arity and the call flags for a JavaScript function call. This is
-// used as a parameter by JSCall and JSCallWithSpread operators.
+// Part of CallParameters::arity.
+// TODO(jgruber): Fold this into JSCallNode.
+static constexpr int kTargetAndReceiver = 2;
+static constexpr int kTargetAndReceiverAndVector = 3;
+
+// Defines the arity (parameters plus the target and receiver) and the call
+// flags for a JavaScript function call. This is used as a parameter by JSCall,
+// JSCallWithArrayLike and JSCallWithSpread operators.
 class CallParameters final {
  public:
   CallParameters(size_t arity, CallFrequency const& frequency,
                  FeedbackSource const& feedback,
                  ConvertReceiverMode convert_mode,
                  SpeculationMode speculation_mode,
-                 CallFeedbackRelation feedback_relation)
+                 CallFeedbackRelation feedback_relation, bool has_vector)
       : bit_field_(ArityField::encode(arity) |
                    CallFeedbackRelationField::encode(feedback_relation) |
                    SpeculationModeField::encode(speculation_mode) |
                    ConvertReceiverModeField::encode(convert_mode)),
         frequency_(frequency),
-        feedback_(feedback) {
+        feedback_(feedback),
+        has_vector_(has_vector) {
     // CallFeedbackRelation is ignored if the feedback slot is invalid.
     DCHECK_IMPLIES(speculation_mode == SpeculationMode::kAllowSpeculation,
                    feedback.IsValid());
     DCHECK_IMPLIES(!feedback.IsValid(),
                    feedback_relation == CallFeedbackRelation::kUnrelated);
+    DCHECK_GE(arity,
+              has_vector_ ? kTargetAndReceiverAndVector : kTargetAndReceiver);
+    DCHECK(is_int32(arity));
   }
 
+  // TODO(jgruber): Consider removing `arity()` and just storing the arity
+  // without extra args in CallParameters.
   size_t arity() const { return ArityField::decode(bit_field_); }
+  int arity_without_implicit_args() const {
+    return static_cast<int>(arity() - (has_vector_ ? kTargetAndReceiverAndVector
+                                                   : kTargetAndReceiver));
+  }
+
   CallFrequency const& frequency() const { return frequency_; }
   ConvertReceiverMode convert_mode() const {
     return ConvertReceiverModeField::decode(bit_field_);
@@ -217,6 +294,8 @@ class CallParameters final {
   uint32_t const bit_field_;
   CallFrequency const frequency_;
   FeedbackSource const feedback_;
+  // TODO(jgruber): Remove once Call variants all have a feedback vector input.
+  bool has_vector_;
 };
 
 size_t hash_value(CallParameters const&);
@@ -733,10 +812,6 @@ std::ostream& operator<<(std::ostream&, ForInMode);
 
 ForInMode ForInModeOf(Operator const* op) V8_WARN_UNUSED_RESULT;
 
-BinaryOperationHint BinaryOperationHintOf(const Operator* op);
-
-CompareOperationHint CompareOperationHintOf(const Operator* op);
-
 int RegisterCountOf(Operator const* op) V8_WARN_UNUSED_RESULT;
 
 int GeneratorStoreValueCountOf(const Operator* op) V8_WARN_UNUSED_RESULT;
@@ -752,30 +827,30 @@ class V8_EXPORT_PRIVATE JSOperatorBuilder final
  public:
   explicit JSOperatorBuilder(Zone* zone);
 
-  const Operator* Equal(CompareOperationHint hint);
-  const Operator* StrictEqual(CompareOperationHint hint);
-  const Operator* LessThan(CompareOperationHint hint);
-  const Operator* GreaterThan(CompareOperationHint hint);
-  const Operator* LessThanOrEqual(CompareOperationHint hint);
-  const Operator* GreaterThanOrEqual(CompareOperationHint hint);
+  const Operator* Equal(FeedbackSource const& feedback);
+  const Operator* StrictEqual(FeedbackSource const& feedback);
+  const Operator* LessThan(FeedbackSource const& feedback);
+  const Operator* GreaterThan(FeedbackSource const& feedback);
+  const Operator* LessThanOrEqual(FeedbackSource const& feedback);
+  const Operator* GreaterThanOrEqual(FeedbackSource const& feedback);
 
-  const Operator* BitwiseOr();
-  const Operator* BitwiseXor();
-  const Operator* BitwiseAnd();
-  const Operator* ShiftLeft();
-  const Operator* ShiftRight();
-  const Operator* ShiftRightLogical();
-  const Operator* Add(BinaryOperationHint hint);
-  const Operator* Subtract();
-  const Operator* Multiply();
-  const Operator* Divide();
-  const Operator* Modulus();
-  const Operator* Exponentiate();
+  const Operator* BitwiseOr(FeedbackSource const& feedback);
+  const Operator* BitwiseXor(FeedbackSource const& feedback);
+  const Operator* BitwiseAnd(FeedbackSource const& feedback);
+  const Operator* ShiftLeft(FeedbackSource const& feedback);
+  const Operator* ShiftRight(FeedbackSource const& feedback);
+  const Operator* ShiftRightLogical(FeedbackSource const& feedback);
+  const Operator* Add(FeedbackSource const& feedback);
+  const Operator* Subtract(FeedbackSource const& feedback);
+  const Operator* Multiply(FeedbackSource const& feedback);
+  const Operator* Divide(FeedbackSource const& feedback);
+  const Operator* Modulus(FeedbackSource const& feedback);
+  const Operator* Exponentiate(FeedbackSource const& feedback);
 
-  const Operator* BitwiseNot();
-  const Operator* Decrement();
-  const Operator* Increment();
-  const Operator* Negate();
+  const Operator* BitwiseNot(FeedbackSource const& feedback);
+  const Operator* Decrement(FeedbackSource const& feedback);
+  const Operator* Increment(FeedbackSource const& feedback);
+  const Operator* Negate(FeedbackSource const& feedback);
 
   const Operator* ToLength();
   const Operator* ToName();
@@ -849,7 +924,8 @@ class V8_EXPORT_PRIVATE JSOperatorBuilder final
   const Operator* Construct(uint32_t arity,
                             CallFrequency const& frequency = CallFrequency(),
                             FeedbackSource const& feedback = FeedbackSource());
-  const Operator* ConstructWithArrayLike(CallFrequency const& frequency);
+  const Operator* ConstructWithArrayLike(CallFrequency const& frequency,
+                                         FeedbackSource const& feedback);
   const Operator* ConstructWithSpread(
       uint32_t arity, CallFrequency const& frequency = CallFrequency(),
       FeedbackSource const& feedback = FeedbackSource());
@@ -945,6 +1021,263 @@ class V8_EXPORT_PRIVATE JSOperatorBuilder final
 
   DISALLOW_COPY_AND_ASSIGN(JSOperatorBuilder);
 };
+
+// Node wrappers.
+
+class JSNodeWrapperBase : public NodeWrapper {
+ public:
+  explicit constexpr JSNodeWrapperBase(Node* node) : NodeWrapper(node) {}
+
+  // Valid iff this node has a context input.
+  TNode<Object> context() const {
+    // Could be a Context or NoContextConstant.
+    return TNode<Object>::UncheckedCast(
+        NodeProperties::GetContextInput(node()));
+  }
+
+  // Valid iff this node has exactly one effect input.
+  Effect effect() const {
+    DCHECK_EQ(node()->op()->EffectInputCount(), 1);
+    return Effect{NodeProperties::GetEffectInput(node())};
+  }
+
+  // Valid iff this node has exactly one control input.
+  Control control() const {
+    DCHECK_EQ(node()->op()->ControlInputCount(), 1);
+    return Control{NodeProperties::GetControlInput(node())};
+  }
+
+  // Valid iff this node has a frame state input.
+  FrameState frame_state() const {
+    return FrameState{NodeProperties::GetFrameStateInput(node())};
+  }
+};
+
+#define DEFINE_INPUT_ACCESSORS(Name, name, TheIndex, Type) \
+  static constexpr int Name##Index() { return TheIndex; }  \
+  TNode<Type> name() const {                               \
+    return TNode<Type>::UncheckedCast(                     \
+        NodeProperties::GetValueInput(node(), TheIndex));  \
+  }
+
+class JSUnaryOpNode final : public JSNodeWrapperBase {
+ public:
+  explicit constexpr JSUnaryOpNode(Node* node) : JSNodeWrapperBase(node) {
+    CONSTEXPR_DCHECK(JSOperator::IsUnaryWithFeedback(node->opcode()));
+  }
+
+#define INPUTS(V)            \
+  V(Value, value, 0, Object) \
+  V(FeedbackVector, feedback_vector, 1, HeapObject)
+  INPUTS(DEFINE_INPUT_ACCESSORS)
+#undef INPUTS
+};
+
+#define V(JSName, ...) using JSName##Node = JSUnaryOpNode;
+JS_UNOP_WITH_FEEDBACK(V)
+#undef V
+
+class JSBinaryOpNode final : public JSNodeWrapperBase {
+ public:
+  explicit constexpr JSBinaryOpNode(Node* node) : JSNodeWrapperBase(node) {
+    CONSTEXPR_DCHECK(JSOperator::IsBinaryWithFeedback(node->opcode()));
+  }
+
+#define INPUTS(V)            \
+  V(Left, left, 0, Object)   \
+  V(Right, right, 1, Object) \
+  V(FeedbackVector, feedback_vector, 2, HeapObject)
+  INPUTS(DEFINE_INPUT_ACCESSORS)
+#undef INPUTS
+};
+
+#define V(JSName, ...) using JSName##Node = JSBinaryOpNode;
+JS_BINOP_WITH_FEEDBACK(V)
+#undef V
+
+class JSGetIteratorNode final : public JSNodeWrapperBase {
+ public:
+  explicit constexpr JSGetIteratorNode(Node* node) : JSNodeWrapperBase(node) {
+    CONSTEXPR_DCHECK(node->opcode() == IrOpcode::kJSGetIterator);
+  }
+
+  const GetIteratorParameters& Parameters() const {
+    return GetIteratorParametersOf(node()->op());
+  }
+
+#define INPUTS(V)                  \
+  V(Receiver, receiver, 0, Object) \
+  V(FeedbackVector, feedback_vector, 1, HeapObject)
+  INPUTS(DEFINE_INPUT_ACCESSORS)
+#undef INPUTS
+};
+
+class JSCloneObjectNode final : public JSNodeWrapperBase {
+ public:
+  explicit constexpr JSCloneObjectNode(Node* node) : JSNodeWrapperBase(node) {
+    CONSTEXPR_DCHECK(node->opcode() == IrOpcode::kJSCloneObject);
+  }
+
+  const CloneObjectParameters& Parameters() const {
+    return CloneObjectParametersOf(node()->op());
+  }
+
+#define INPUTS(V)              \
+  V(Source, source, 0, Object) \
+  V(FeedbackVector, feedback_vector, 1, HeapObject)
+  INPUTS(DEFINE_INPUT_ACCESSORS)
+#undef INPUTS
+};
+
+class JSGetTemplateObjectNode final : public JSNodeWrapperBase {
+ public:
+  explicit constexpr JSGetTemplateObjectNode(Node* node)
+      : JSNodeWrapperBase(node) {
+    CONSTEXPR_DCHECK(node->opcode() == IrOpcode::kJSGetTemplateObject);
+  }
+
+  const GetTemplateObjectParameters& Parameters() const {
+    return GetTemplateObjectParametersOf(node()->op());
+  }
+
+#define INPUTS(V) V(FeedbackVector, feedback_vector, 0, HeapObject)
+  INPUTS(DEFINE_INPUT_ACCESSORS)
+#undef INPUTS
+};
+
+class JSCreateLiteralOpNode final : public JSNodeWrapperBase {
+ public:
+  explicit constexpr JSCreateLiteralOpNode(Node* node)
+      : JSNodeWrapperBase(node) {
+    CONSTEXPR_DCHECK(node->opcode() == IrOpcode::kJSCreateLiteralArray ||
+                     node->opcode() == IrOpcode::kJSCreateLiteralObject ||
+                     node->opcode() == IrOpcode::kJSCreateLiteralRegExp);
+  }
+
+  const CreateLiteralParameters& Parameters() const {
+    return CreateLiteralParametersOf(node()->op());
+  }
+
+#define INPUTS(V) V(FeedbackVector, feedback_vector, 0, HeapObject)
+  INPUTS(DEFINE_INPUT_ACCESSORS)
+#undef INPUTS
+};
+
+using JSCreateLiteralArrayNode = JSCreateLiteralOpNode;
+using JSCreateLiteralObjectNode = JSCreateLiteralOpNode;
+using JSCreateLiteralRegExpNode = JSCreateLiteralOpNode;
+
+class JSHasPropertyNode final : public JSNodeWrapperBase {
+ public:
+  explicit constexpr JSHasPropertyNode(Node* node) : JSNodeWrapperBase(node) {
+    CONSTEXPR_DCHECK(node->opcode() == IrOpcode::kJSHasProperty);
+  }
+
+  const PropertyAccess& Parameters() const {
+    return PropertyAccessOf(node()->op());
+  }
+
+#define INPUTS(V)              \
+  V(Object, object, 0, Object) \
+  V(Key, key, 1, Object)       \
+  V(FeedbackVector, feedback_vector, 2, HeapObject)
+  INPUTS(DEFINE_INPUT_ACCESSORS)
+#undef INPUTS
+};
+
+class JSLoadPropertyNode final : public JSNodeWrapperBase {
+ public:
+  explicit constexpr JSLoadPropertyNode(Node* node) : JSNodeWrapperBase(node) {
+    CONSTEXPR_DCHECK(node->opcode() == IrOpcode::kJSLoadProperty);
+  }
+
+  const PropertyAccess& Parameters() const {
+    return PropertyAccessOf(node()->op());
+  }
+
+#define INPUTS(V)              \
+  V(Object, object, 0, Object) \
+  V(Key, key, 1, Object)       \
+  V(FeedbackVector, feedback_vector, 2, HeapObject)
+  INPUTS(DEFINE_INPUT_ACCESSORS)
+#undef INPUTS
+};
+
+class JSStorePropertyNode final : public JSNodeWrapperBase {
+ public:
+  explicit constexpr JSStorePropertyNode(Node* node) : JSNodeWrapperBase(node) {
+    CONSTEXPR_DCHECK(node->opcode() == IrOpcode::kJSStoreProperty);
+  }
+
+  const PropertyAccess& Parameters() const {
+    return PropertyAccessOf(node()->op());
+  }
+
+#define INPUTS(V)              \
+  V(Object, object, 0, Object) \
+  V(Key, key, 1, Object)       \
+  V(Value, value, 2, Object)   \
+  V(FeedbackVector, feedback_vector, 3, HeapObject)
+  INPUTS(DEFINE_INPUT_ACCESSORS)
+#undef INPUTS
+};
+
+class JSCallNode final : public JSNodeWrapperBase {
+ public:
+  explicit constexpr JSCallNode(Node* node) : JSNodeWrapperBase(node) {
+    CONSTEXPR_DCHECK(node->opcode() == IrOpcode::kJSCall);
+  }
+
+  const CallParameters& Parameters() const {
+    return CallParametersOf(node()->op());
+  }
+
+#define INPUTS(V)              \
+  V(Target, target, 0, Object) \
+  V(Receiver, receiver, 1, Object)
+  INPUTS(DEFINE_INPUT_ACCESSORS)
+#undef INPUTS
+
+  // Besides actual arguments, JSCall nodes also take:
+  static constexpr int kTargetInputCount = 1;
+  static constexpr int kReceiverInputCount = 1;
+  static constexpr int kFeedbackVectorInputCount = 1;
+  static constexpr int kExtraInputCount =
+      kTargetInputCount + kReceiverInputCount + kFeedbackVectorInputCount;
+
+  // This is the arity fed into CallArguments.
+  static constexpr int ArityForArgc(int parameters) {
+    return parameters + kExtraInputCount;
+  }
+
+  static constexpr int FirstArgumentIndex() { return ReceiverIndex() + 1; }
+  static constexpr int ArgumentIndex(int i) { return FirstArgumentIndex() + i; }
+  TNode<Object> Argument(int i) const {
+    DCHECK_LT(i, ArgumentCount());
+    return TNode<Object>::UncheckedCast(
+        NodeProperties::GetValueInput(node(), ArgumentIndex(i)));
+  }
+  TNode<Object> ArgumentOr(int i, Node* default_value) const {
+    return i < ArgumentCount() ? Argument(i)
+                               : TNode<Object>::UncheckedCast(default_value);
+  }
+  TNode<Object> ArgumentOrUndefined(int i, JSGraph* jsgraph) const;
+  int ArgumentCount() const {
+    DCHECK_GE(node()->op()->ValueInputCount(), kExtraInputCount);
+    return node()->op()->ValueInputCount() - kExtraInputCount;
+  }
+
+  int FeedbackVectorIndex() const {
+    DCHECK_GE(node()->op()->ValueInputCount(), 1);
+    return node()->op()->ValueInputCount() - 1;
+  }
+  TNode<HeapObject> feedback_vector() const {
+    return TNode<HeapObject>::UncheckedCast(
+        NodeProperties::GetValueInput(node(), FeedbackVectorIndex()));
+  }
+};
+
+#undef DEFINE_INPUT_ACCESSORS
 
 }  // namespace compiler
 }  // namespace internal
